@@ -15,6 +15,8 @@
 #include <thread>
 #include <atomic>
 #include <mutex>
+#include <queue>
+#include <condition_variable>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -23,6 +25,11 @@
 std::atomic<bool> running(true);
 cv::Mat current_frame;
 std::mutex frame_mutex;
+
+// 异步删除队列
+std::queue<std::string> delete_queue;
+std::mutex delete_mutex;
+std::condition_variable delete_cv;
 
 // 获取磁盘空间，返回剩余空间
 long long get_free_disk_space(const std::string& path) {
@@ -34,12 +41,12 @@ long long get_free_disk_space(const std::string& path) {
     return buf.f_bsize * buf.f_bfree;
 }
 
-// 删除最旧的文件
-void delete_oldest_file(const std::string& dir) {
+// 获取最旧的文件路径
+std::string get_oldest_file(const std::string& dir) {
     DIR* d = opendir(dir.c_str());
     if (!d) {
         std::cerr << "无法打开目录：" << dir << std::endl;
-        return;
+        return "";
     }
 
     struct dirent* entry;
@@ -60,13 +67,72 @@ void delete_oldest_file(const std::string& dir) {
     }
 
     closedir(d);
+    return oldest_file;
+}
 
-    if (!oldest_file.empty()) {
-        if (remove(oldest_file.c_str()) == 0) {
-            std::cout << "删除了最旧的文件：" << oldest_file << std::endl;
-        } else {
-            std::cerr << "删除文件失败：" << oldest_file << std::endl;
+// 异步删除文件的线程
+void async_delete_thread() {
+    while (running) {
+        std::unique_lock<std::mutex> lock(delete_mutex);
+        
+        // 等待删除任务
+        delete_cv.wait(lock, []{ return !delete_queue.empty() || !running; });
+        
+        if (!running && delete_queue.empty()) break;
+        
+        if (!delete_queue.empty()) {
+            std::string file_to_delete = delete_queue.front();
+            delete_queue.pop();
+            lock.unlock();
+            
+            // 执行删除操作（不阻塞主线程）
+            if (remove(file_to_delete.c_str()) == 0) {
+                std::cout << "✓ 已删除最旧的文件：" << file_to_delete << std::endl;
+            } else {
+                std::cerr << "✗ 删除文件失败：" << file_to_delete << std::endl;
+            }
         }
+    }
+}
+
+// 将文件加入删除队列
+void queue_file_for_deletion(const std::string& filepath) {
+    if (filepath.empty()) return;
+    
+    std::lock_guard<std::mutex> lock(delete_mutex);
+    delete_queue.push(filepath);
+    delete_cv.notify_one();
+    std::cout << "→ 文件已加入删除队列：" << filepath << std::endl;
+}
+
+// 确保磁盘空间大于指定值
+void ensure_disk_space(const std::string& dir, long long min_space_bytes) {
+    while (true) {
+        long long free_space = get_free_disk_space(dir);
+        if (free_space < 0) {
+            std::cerr << "无法获取磁盘空间信息" << std::endl;
+            break;
+        }
+        
+        if (free_space >= min_space_bytes) {
+            std::cout << "✓ 磁盘空间充足: " << (free_space / 1024 / 1024) << " MB" << std::endl;
+            break;
+        }
+        
+        std::cout << "⚠ 磁盘空间不足: " << (free_space / 1024 / 1024) 
+                  << " MB，需要删除最旧的视频..." << std::endl;
+        
+        std::string oldest = get_oldest_file(dir);
+        if (oldest.empty()) {
+            std::cerr << "✗ 没有可删除的文件，无法释放空间" << std::endl;
+            break;
+        }
+        
+        // 异步删除，不阻塞
+        queue_file_for_deletion(oldest);
+        
+        // 等待一小段时间让删除操作完成
+        usleep(100000); // 100ms
     }
 }
 
@@ -362,8 +428,11 @@ int main() {
     // 启动Web服务器线程
     std::thread web_thread(web_server_thread);
     
+    // 启动异步删除线程
+    std::thread delete_thread(async_delete_thread);
+    
     // 主进程稍等等待管道流有效
-    usleep(100000);
+    usleep(600000);
 
     // OpenCV读取mjpeg管道流
     cv::VideoCapture cap("/tmp/camfifo");
@@ -371,7 +440,9 @@ int main() {
         std::cerr << "无法打开 rpicam-vid 管道流！" << std::endl;
         running = false;
         kill(pid, SIGTERM);
+        delete_cv.notify_all();
         web_thread.join();
+        delete_thread.join();
         return -1;
     }
     
@@ -388,7 +459,9 @@ int main() {
         std::cerr << "无法获取用户主目录！" << std::endl;
         running = false;
         kill(pid, SIGTERM);
+        delete_cv.notify_all();
         web_thread.join();
+        delete_thread.join();
         return -1;
     }
 
@@ -399,12 +472,12 @@ int main() {
     }
 
     while (running) {
-        long long free_space = get_free_disk_space(output_dir);
-        if (free_space >= 0 && free_space < 1024 * 1024 * 1024) {
-            delete_oldest_file(output_dir);
-        }
-
+        // 开启新视频时，确保磁盘空间大于200MB
         if (!writer.isOpened()) {
+            long long min_space = 200 * 1024 * 1024; // 200 MB
+            ensure_disk_space(output_dir, min_space);
+            
+            // 获取当前时间并格式化为文件名
             std::time_t t = std::time(nullptr);
             char buf[32];
             std::strftime(buf, sizeof(buf), "%Y-%m-%d_%H-%M-%S", std::localtime(&t));
@@ -415,14 +488,14 @@ int main() {
                 std::cerr << "无法创建视频文件：" << filename << std::endl;
                 break;
             }
+            std::cout << "开始录制新视频: " << filename << std::endl;
             start_time = std::chrono::steady_clock::now();
         }
         
         cv::Mat frame;
         if (!cap.read(frame) || frame.empty()) {
             std::cerr << "帧读取失败!" << std::endl;
-            exit(1);  // 使用 exit(1) 来表示程序异常终止
-            // break;
+            break;
         }
         
         // 添加时间戳（背景透明，文字半透明）
@@ -465,7 +538,12 @@ int main() {
     writer.release();
     cv::destroyAllWindows();
     kill(pid, SIGTERM);
+    
+    // 通知删除线程退出
+    delete_cv.notify_all();
+    
     web_thread.join();
+    delete_thread.join();
     
     return 0;
 }
