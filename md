@@ -1,0 +1,1 @@
+g++ -o video_recorder main.cpp     `pkg-config --cflags --libs opencv4`     -lpthread -std=c++11
