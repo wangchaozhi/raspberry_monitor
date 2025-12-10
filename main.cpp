@@ -22,6 +22,7 @@
 #include <arpa/inet.h>
 #include <vector>
 #include <algorithm>
+#include <queue>
 
 // 全局变量
 std::atomic<bool> running(true);
@@ -30,108 +31,16 @@ std::mutex frame_mutex;
 std::string video_dir_global;
 pid_t audio_pid = -1;
 
-// ==================== 配置区域 ====================
-
-// 分辨率预设枚举
-enum class Resolution {
-    SD_480P,      // 640×480   - 标清，省空间
-    HD_720P,      // 1280×720  - 高清，推荐
-    FHD_1080P,    // 1920×1080 - 全高清
-    ULTRA_5MP     // 2592×1944 - 超高清（USB摄像头最大）
+// 合成任务队列
+struct MergeTask {
+    std::string video_file;
+    std::string audio_file;
+    std::string output_file;
 };
 
-// 帧率预设枚举
-enum class FrameRate {
-    FPS_15,       // 15 FPS - 省空间
-    FPS_20,       // 20 FPS - 平衡
-    FPS_25,       // 25 FPS - PAL标准
-    FPS_30        // 30 FPS - 流畅
-};
-
-// 音频质量预设枚举
-enum class AudioQuality {
-    LOW,          // 64kbps  - 省空间，语音清晰
-    MEDIUM,       // 96kbps  - 平衡
-    HIGH,         // 128kbps - 高质量
-    VERY_HIGH     // 192kbps - 音乐级
-};
-
-// ========== 在这里选择配置 ==========
-const bool USE_USB_CAMERA = true;           // true=USB摄像头, false=CSI摄像头
-const int USB_CAMERA_INDEX = 1;             // /dev/video1
-
-const Resolution RECORDING_RESOLUTION = Resolution::HD_720P;   // 选择分辨率
-const FrameRate RECORDING_FRAMERATE = FrameRate::FPS_20;      // 选择帧率
-const AudioQuality AUDIO_QUALITY = AudioQuality::MEDIUM;      // 选择音频质量
-// ====================================
-
-// 分辨率映射
-struct ResolutionConfig {
-    int width;
-    int height;
-    const char* name;
-};
-
-ResolutionConfig getResolution(Resolution res) {
-    switch (res) {
-        case Resolution::SD_480P:
-            return {640, 480, "640×480 (标清)"};
-        case Resolution::HD_720P:
-            return {1280, 720, "1280×720 (高清)"};
-        case Resolution::FHD_1080P:
-            return {1920, 1080, "1920×1080 (全高清)"};
-        case Resolution::ULTRA_5MP:
-            return {2592, 1944, "2592×1944 (5MP超清)"};
-        default:
-            return {1280, 720, "1280×720 (高清)"};
-    }
-}
-
-// 帧率映射
-struct FrameRateConfig {
-    int fps;
-    const char* name;
-};
-
-FrameRateConfig getFrameRate(FrameRate fr) {
-    switch (fr) {
-        case FrameRate::FPS_15:
-            return {15, "15 FPS (省空间)"};
-        case FrameRate::FPS_20:
-            return {20, "20 FPS (平衡)"};
-        case FrameRate::FPS_25:
-            return {25, "25 FPS (PAL)"};
-        case FrameRate::FPS_30:
-            return {30, "30 FPS (流畅)"};
-        default:
-            return {20, "20 FPS (平衡)"};
-    }
-}
-
-// 音频质量映射
-struct AudioQualityConfig {
-    int bitrate_kbps;
-    int sample_rate;
-    const char* name;
-    const char* bitrate_str;
-};
-
-AudioQualityConfig getAudioQuality(AudioQuality aq) {
-    switch (aq) {
-        case AudioQuality::LOW:
-            return {64, 22050, "低质量 (语音)", "64k"};
-        case AudioQuality::MEDIUM:
-            return {96, 22050, "中质量 (推荐)", "96k"};
-        case AudioQuality::HIGH:
-            return {128, 44100, "高质量", "128k"};
-        case AudioQuality::VERY_HIGH:
-            return {192, 44100, "超高质量 (音乐)", "192k"};
-        default:
-            return {96, 22050, "中质量 (推荐)", "96k"};
-    }
-}
-
-// ==================== 配置区域结束 ====================
+std::queue<MergeTask> merge_queue;
+std::mutex merge_queue_mutex;
+std::atomic<bool> is_merging(false);
 
 // 文件信息结构体
 struct FileInfo {
@@ -168,7 +77,6 @@ std::vector<FileInfo> get_video_files(const std::string& dir) {
             std::string filename = entry->d_name;
             if ((filename.length() > 4 && filename.substr(filename.length() - 4) == ".avi") ||
                 (filename.length() > 4 && filename.substr(filename.length() - 4) == ".wav") ||
-                (filename.length() > 4 && filename.substr(filename.length() - 4) == ".aac") ||
                 (filename.length() > 4 && filename.substr(filename.length() - 4) == ".mp4")) {
                 std::string file_path = dir + "/" + filename;
                 struct stat file_stat;
@@ -226,6 +134,103 @@ void ensure_disk_space(const std::string& dir, long long min_space_bytes) {
     }
 }
 
+// 异步合成线程
+void merge_worker_thread() {
+    while (running) {
+        MergeTask task;
+        bool has_task = false;
+        
+        {
+            std::lock_guard<std::mutex> lock(merge_queue_mutex);
+            if (!merge_queue.empty()) {
+                task = merge_queue.front();
+                merge_queue.pop();
+                has_task = true;
+                is_merging = true;
+            }
+        }
+        
+        if (has_task) {
+            std::cout << "\n→ [异步合成] 开始合并: " << task.output_file << std::endl;
+            
+            // 构建ffmpeg命令
+            std::string ffmpeg_cmd = "ffmpeg -y -i " + task.video_file + 
+                                    " -i " + task.audio_file + 
+                                    " -c:v copy -c:a aac -strict experimental " + 
+                                    task.output_file + " > /dev/null 2>&1";
+            
+            int result = std::system(ffmpeg_cmd.c_str());
+            
+            if (result == 0 && access(task.output_file.c_str(), F_OK) == 0) {
+                std::cout << "✓ [异步合成] 合并成功: " << task.output_file << std::endl;
+                
+                // 删除原始文件
+                remove(task.video_file.c_str());
+                remove(task.audio_file.c_str());
+                std::cout << "✓ [异步合成] 清理临时文件完成" << std::endl;
+            } else {
+                std::cerr << "✗ [异步合成] 合并失败，保留原始文件" << std::endl;
+            }
+            
+            is_merging = false;
+        } else {
+            sleep(2);
+        }
+    }
+}
+
+// 检查并添加未合成的文件到队列
+void check_unmerged_files(const std::string& dir) {
+    std::cout << "\n→ 检查未合成的视频文件..." << std::endl;
+    
+    DIR* d = opendir(dir.c_str());
+    if (!d) return;
+    
+    std::vector<std::string> avi_files;
+    struct dirent* entry;
+    
+    while ((entry = readdir(d)) != nullptr) {
+        if (entry->d_type == DT_REG) {
+            std::string filename = entry->d_name;
+            if (filename.length() > 4 && filename.substr(filename.length() - 4) == ".avi") {
+                avi_files.push_back(filename);
+            }
+        }
+    }
+    closedir(d);
+    
+    int found_count = 0;
+    for (const auto& avi_file : avi_files) {
+        std::string base_name = avi_file.substr(0, avi_file.length() - 4);
+        std::string wav_file = base_name + ".wav";
+        std::string mp4_file = base_name + ".mp4";
+        
+        std::string avi_path = dir + "/" + avi_file;
+        std::string wav_path = dir + "/" + wav_file;
+        std::string mp4_path = dir + "/" + mp4_file;
+        
+        // 检查是否存在对应的wav文件，且不存在mp4文件
+        if (access(wav_path.c_str(), F_OK) == 0 && access(mp4_path.c_str(), F_OK) != 0) {
+            MergeTask task;
+            task.video_file = avi_path;
+            task.audio_file = wav_path;
+            task.output_file = mp4_path;
+            
+            std::lock_guard<std::mutex> lock(merge_queue_mutex);
+            merge_queue.push(task);
+            found_count++;
+            
+            std::cout << "  + 发现未合成文件: " << avi_file << std::endl;
+        }
+    }
+    
+    if (found_count > 0) {
+        std::cout << "✓ 找到 " << found_count << " 个未合成文件，已加入队列" << std::endl;
+    } else {
+        std::cout << "✓ 没有发现未合成的文件" << std::endl;
+    }
+}
+
 std::string url_decode(const std::string& str) {
     std::string result;
     for (size_t i = 0; i < str.length(); i++) {
@@ -276,6 +281,39 @@ void send_http_response(int client_sock, const std::string& content_type, const 
     send(client_sock, resp_str.c_str(), resp_str.length(), 0);
 }
 
+void send_file_download(int client_sock, const std::string& filepath, const std::string& filename) {
+    std::ifstream file(filepath, std::ios::binary);
+    if (!file.is_open()) {
+        std::string error_response = "HTTP/1.1 404 Not Found\r\nContent-Length: 14\r\n\r\nFile not found";
+        send(client_sock, error_response.c_str(), error_response.length(), 0);
+        return;
+    }
+    
+    // 获取文件大小
+    file.seekg(0, std::ios::end);
+    long long file_size = file.tellg();
+    file.seekg(0, std::ios::beg);
+    
+    // 发送响应头
+    std::ostringstream header;
+    header << "HTTP/1.1 200 OK\r\n";
+    header << "Content-Type: application/octet-stream\r\n";
+    header << "Content-Disposition: attachment; filename=\"" << filename << "\"\r\n";
+    header << "Content-Length: " << file_size << "\r\n";
+    header << "Connection: close\r\n\r\n";
+    
+    std::string header_str = header.str();
+    send(client_sock, header_str.c_str(), header_str.length(), 0);
+    
+    // 发送文件内容
+    char buffer[8192];
+    while (file.read(buffer, sizeof(buffer)) || file.gcount() > 0) {
+        send(client_sock, buffer, file.gcount(), 0);
+    }
+    
+    file.close();
+}
+
 void handle_client(int client_sock) {
     char buffer[4096];
     int bytes_read = recv(client_sock, buffer, sizeof(buffer) - 1, 0);
@@ -306,10 +344,14 @@ void handle_client(int client_sock) {
         std::ostringstream file_rows;
         for (const auto& file : files) {
             file_rows << "<tr>"
-                      << "<td>" << file.name << "</td>"
+                      << "<td><span class='file-name-link' onclick='downloadFile(\"" << file.name << "\")'>" 
+                      << file.name << "</span></td>"
                       << "<td>" << format_size(file.size) << "</td>"
                       << "<td>" << format_time(file.mtime) << "</td>"
-                      << "<td><button class='delete-btn' onclick='deleteFile(\"" << file.name << "\")'>删除</button></td>"
+                      << "<td>"
+                      << "<button class='download-btn' onclick='downloadFile(\"" << file.name << "\")'>下载</button> "
+                      << "<button class='delete-btn' onclick='deleteFile(\"" << file.name << "\")'>删除</button>"
+                      << "</td>"
                       << "</tr>";
         }
         
@@ -319,6 +361,19 @@ void handle_client(int client_sock) {
         html = replace_placeholder(html, "{{FILE_ROWS}}", file_rows.str());
         
         send_http_response(client_sock, "text/html; charset=utf-8", html);
+    }
+    else if (request.find("GET /download?") == 0) {
+        size_t pos = request.find("file=");
+        if (pos != std::string::npos) {
+            size_t end = request.find(" ", pos);
+            std::string filename = request.substr(pos + 5, end - pos - 5);
+            filename = url_decode(filename);
+            
+            if (filename.find("/") == std::string::npos && filename.find("..") == std::string::npos) {
+                std::string filepath = video_dir_global + "/" + filename;
+                send_file_download(client_sock, filepath, filename);
+            }
+        }
     }
     else if (request.find("GET /delete?") == 0) {
         size_t pos = request.find("file=");
@@ -408,21 +463,8 @@ void web_server_thread() {
 }
 
 int main() {
-    // 获取配置
-    ResolutionConfig resConfig = getResolution(RECORDING_RESOLUTION);
-    FrameRateConfig fpsConfig = getFrameRate(RECORDING_FRAMERATE);
-    AudioQualityConfig audioConfig = getAudioQuality(AUDIO_QUALITY);
-    
     std::cout << "========================================" << std::endl;
     std::cout << "  树莓派音频+视频录制监控系统" << std::endl;
-    if (USE_USB_CAMERA) {
-        std::cout << "  摄像头: USB Camera (/dev/video" << USB_CAMERA_INDEX << ")" << std::endl;
-    } else {
-        std::cout << "  摄像头: CSI Camera (rpicam-vid)" << std::endl;
-    }
-    std::cout << "  分辨率: " << resConfig.name << std::endl;
-    std::cout << "  帧率: " << fpsConfig.name << std::endl;
-    std::cout << "  音频: " << audioConfig.name << " (" << audioConfig.bitrate_kbps << "kbps)" << std::endl;
     std::cout << "========================================" << std::endl;
     
     const char* home_dir = std::getenv("HOME");
@@ -431,76 +473,45 @@ int main() {
     video_dir_global = std::string(home_dir) + "/videos/";
     std::system(("mkdir -p " + video_dir_global).c_str());
     
+    // 启动异步合成线程
+    std::thread merge_thread(merge_worker_thread);
+    
+    // 检查未合成的文件
+    check_unmerged_files(video_dir_global);
+    
+    if (access("/tmp/camfifo", F_OK) == -1) {
+        std::system("mkfifo /tmp/camfifo");
+    }
+    
+    // 启动摄像头（MJPEG for Web preview）
+    std::cout << "→ 启动摄像头..." << std::endl;
+    pid_t cam_pid = fork();
+    if (cam_pid == 0) {
+        execlp("rpicam-vid", "rpicam-vid", "-t", "0",
+               "--codec", "mjpeg", "--width", "640", "--height", "480",
+               "--framerate", "20", "-o", "/tmp/camfifo", (char*)NULL);
+        exit(1);
+    }
+    
     std::thread web_thread(web_server_thread);
     
-    cv::VideoCapture cap;
-    pid_t cam_pid = -1;
-    
-    if (USE_USB_CAMERA) {
-        // 使用USB摄像头（使用V4L2后端避免GStreamer警告）
-        std::cout << "→ 打开USB摄像头..." << std::endl;
-        cap.open(USB_CAMERA_INDEX, cv::CAP_V4L2);
-        
-        if (!cap.isOpened()) {
-            std::cerr << "✗ 无法打开USB摄像头 /dev/video" << USB_CAMERA_INDEX << std::endl;
-            running = false;
-            web_thread.join();
-            return -1;
-        }
-        
-        // 设置分辨率和帧率
-        cap.set(cv::CAP_PROP_FRAME_WIDTH, resConfig.width);
-        cap.set(cv::CAP_PROP_FRAME_HEIGHT, resConfig.height);
-        cap.set(cv::CAP_PROP_FPS, fpsConfig.fps);
-        
-        // 读取实际值
-        int actual_width = (int)cap.get(cv::CAP_PROP_FRAME_WIDTH);
-        int actual_height = (int)cap.get(cv::CAP_PROP_FRAME_HEIGHT);
-        int actual_fps = (int)cap.get(cv::CAP_PROP_FPS);
-        
-        std::cout << "✓ USB摄像头已就绪" << std::endl;
-        std::cout << "  实际分辨率: " << actual_width << "x" << actual_height << std::endl;
-        if (actual_fps > 0) {
-            std::cout << "  实际帧率: " << actual_fps << " FPS" << std::endl;
-        } else {
-            std::cout << "  帧率: 自动" << std::endl;
-        }
-        
-    } else {
-        // 使用CSI摄像头（原有方式）
-        if (access("/tmp/camfifo", F_OK) == -1) {
-            std::system("mkfifo /tmp/camfifo");
-        }
-        
-        std::cout << "→ 启动CSI摄像头..." << std::endl;
-        cam_pid = fork();
-        if (cam_pid == 0) {
-            execlp("rpicam-vid", "rpicam-vid", "-t", "0",
-                   "--codec", "mjpeg", "--width", "640", "--height", "480",
-                   "--framerate", "20", "-o", "/tmp/camfifo", (char*)NULL);
-            exit(1);
-        }
-        
-        sleep(2);
-        cap.open("/tmp/camfifo");
-        
-        if (!cap.isOpened()) {
-            std::cerr << "✗ 无法打开CSI摄像头！" << std::endl;
-            running = false;
-            kill(cam_pid, SIGTERM);
-            web_thread.join();
-            return -1;
-        }
-        
-        std::cout << "✓ CSI摄像头已就绪" << std::endl;
+    sleep(2);
+    cv::VideoCapture cap("/tmp/camfifo");
+    if (!cap.isOpened()) {
+        std::cerr << "✗ 无法打开摄像头！" << std::endl;
+        running = false;
+        kill(cam_pid, SIGTERM);
+        web_thread.join();
+        merge_thread.join();
+        return -1;
     }
     
     std::cout << "✓ 系统就绪！" << std::endl;
     std::cout << "========================================" << std::endl;
     
-    int fps = fpsConfig.fps;
-    int width = resConfig.width;
-    int height = resConfig.height;
+    int fps = 20;
+    int width = 640;
+    int height = 480;
     int record_duration_sec = 3600;  // 1小时
     
     cv::VideoWriter writer;
@@ -518,24 +529,10 @@ int main() {
             std::strftime(buf, sizeof(buf), "%Y-%m-%d_%H-%M-%S", std::localtime(&t));
             
             video_filename = video_dir_global + std::string(buf) + ".avi";
-            audio_filename = video_dir_global + std::string(buf) + ".aac";  // 直接录制AAC
+            audio_filename = video_dir_global + std::string(buf) + ".wav";
             
-            // 使用H.264编码（更好的压缩）
-            // 尝试硬件加速编码器，失败则用软件编码
-            int codec = cv::VideoWriter::fourcc('H','2','6','4');
-            writer.open(video_filename, codec, fps, cv::Size(width, height));
-            
-            if (!writer.isOpened()) {
-                std::cout << "→ H.264硬件编码失败，尝试软件编码..." << std::endl;
-                codec = cv::VideoWriter::fourcc('X','2','6','4');
-                writer.open(video_filename, codec, fps, cv::Size(width, height));
-            }
-            
-            if (!writer.isOpened()) {
-                std::cout << "→ H.264编码失败，使用MJPEG..." << std::endl;
-                codec = cv::VideoWriter::fourcc('M','J','P','G');
-                writer.open(video_filename, codec, fps, cv::Size(width, height));
-            }
+            writer.open(video_filename, cv::VideoWriter::fourcc('M','J','P','G'), 
+                       fps, cv::Size(width, height));
             
             if (!writer.isOpened()) {
                 std::cerr << "✗ 无法创建视频文件！" << std::endl;
@@ -543,21 +540,14 @@ int main() {
                 continue;
             }
             
-            // 直接录制为AAC格式（压缩音频）
+            // 启动音频录制
             audio_pid = fork();
             if (audio_pid == 0) {
-                // 使用ffmpeg直接录制为AAC
-                std::string sample_rate_str = std::to_string(audioConfig.sample_rate);
-                std::string duration_str = "3600";  // 1小时
-                
-                execlp("ffmpeg", "ffmpeg",
-                       "-f", "alsa",
-                       "-i", "plughw:CARD=Device,DEV=0",
-                       "-ac", "1",                                    // 单声道
-                       "-ar", sample_rate_str.c_str(),                // 采样率
-                       "-c:a", "aac",                                 // AAC编码
-                       "-b:a", audioConfig.bitrate_str,               // 比特率
-                       "-t", duration_str.c_str(),                    // 录制时长
+                execlp("arecord", "arecord",
+                       "-D", "plughw:CARD=Device,DEV=0",
+                       "-f", "cd",
+                       "-t", "wav",
+                       "-d", "3600",
                        audio_filename.c_str(),
                        (char*)NULL);
                 exit(1);
@@ -594,7 +584,7 @@ int main() {
         if (std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::steady_clock::now() - start_time).count() >= record_duration_sec) {
             
-            std::cout << "✓ 录制完成，准备合并音视频..." << std::endl;
+            std::cout << "✓ 录制完成，准备异步合成..." << std::endl;
             writer.release();
             
             if (audio_pid > 0) {
@@ -613,30 +603,20 @@ int main() {
             if (access(video_filename.c_str(), F_OK) == 0 && 
                 access(audio_filename.c_str(), F_OK) == 0) {
                 
-                std::cout << "→ 合并音视频: " << mp4_filename << std::endl;
+                // 添加到异步合成队列
+                MergeTask task;
+                task.video_file = video_filename;
+                task.audio_file = audio_filename;
+                task.output_file = mp4_filename;
                 
-                // 构建ffmpeg命令 - 音频已经是AAC，直接复制
-                std::string ffmpeg_cmd = "ffmpeg -y -i " + video_filename + 
-                                        " -i " + audio_filename + 
-                                        " -c:v libx264 -preset medium -crf 23 " +  // H.264视频压缩
-                                        " -c:a copy " +                             // AAC音频直接复制
-                                        mp4_filename + " 2>&1 | grep -E '(error|Error|ERROR)' || true";
-                
-                int result = std::system(ffmpeg_cmd.c_str());
-                
-                if (result == 0 && access(mp4_filename.c_str(), F_OK) == 0) {
-                    std::cout << "✓ 合并成功！" << std::endl;
-                    
-                    // 删除原始AVI和AAC文件
-                    std::cout << "→ 清理临时文件..." << std::endl;
-                    remove(video_filename.c_str());
-                    remove(audio_filename.c_str());
-                    std::cout << "✓ 清理完成" << std::endl;
-                } else {
-                    std::cerr << "✗ 合并失败，保留原始文件" << std::endl;
+                {
+                    std::lock_guard<std::mutex> lock(merge_queue_mutex);
+                    merge_queue.push(task);
                 }
+                
+                std::cout << "✓ 已添加到合成队列: " << mp4_filename << std::endl;
             } else {
-                std::cerr << "✗ 音频或视频文件缺失，无法合并" << std::endl;
+                std::cerr << "✗ 音频或视频文件缺失，无法合成" << std::endl;
             }
         }
     }
@@ -650,6 +630,7 @@ int main() {
     if (audio_pid > 0) kill(audio_pid, SIGTERM);
     
     web_thread.join();
+    merge_thread.join();
     std::cout << "✓ 系统已关闭" << std::endl;
     
     return 0;
